@@ -11,14 +11,18 @@ Function FindPausesMenu()
 	String wylist = WaveList("*", ";", "")
 	String wxlist = "__Use x scaling__;"+WaveList("*", ";", "")
 	String sigmalist = "__none__;"+WaveList("*", ";", "")
+	String changepoints = "Only pauses;Change points and pauses;Only change points;"
 	
 	String wnameY, wnameX, wnamesigma
 	Prompt wnameY, "Y wave", popup, wylist
 	Prompt wnameX, "X wave", popup, wxlist
 	Prompt wnameSigma, "Y err (=sigma) wave", popup, sigmalist
-	DoPrompt "Find Pauses", wnameY, wnameX, wnameSigma
+	Prompt changepoints, "Find", popup, changepoints
+	DoPrompt "Find Pauses", wnameY, wnameX, wnameSigma, changepoints
 	
 	Wave wy=$wnameY, wx=$wnameX, wsigma=$wnameSigma
+	Variable allowChangepoints = Stringmatch(changepoints, "Change points and pauses")
+	Variable onlyChangepoints = Stringmatch(changepoints, "Only change points")
 	
 	if(!WaveExists(wy))
 		return NaN
@@ -37,7 +41,7 @@ Function FindPausesMenu()
 		endif
 	endif
 	
-	Wave W_Pauses = FindPausesMCMC_MT(wy, xwave=wx, sigmawave=wSigma)
+	Wave W_Pauses = FindPausesMCMC_MT(wy, xwave=wx, sigmawave=wSigma, allowChangepoints=allowChangepoints, onlyChangepoints=onlyChangepoints)
 	DFREF fld = getwavesdatafolderdfr(W_Pauses)
 	Wave/SDFR=fld traj, bestfit, bestfit_colorwave, xwave
 	DoWindow FindPausesResults
@@ -88,7 +92,7 @@ Threadsafe Static Function GetSIC(Wave traj, Wave W_pauses [Variable noiseSigma,
 	//--- Fit pauses
 	Variable firstPauseStart = inf, lastPauseEnd = -inf
 	Variable i
-	Variable v_PausesOK = 0
+	Variable v_PausesOK = 1
 	for(i=Npauses-1;i>=0;i-=1)
 		Variable pauseStart = W_PausesUSED[i][0]
 		Variable pauseEnd = pauseStart+W_PausesUSED[i][1]
@@ -96,14 +100,111 @@ Threadsafe Static Function GetSIC(Wave traj, Wave W_pauses [Variable noiseSigma,
 		firstPauseStart = min(firstPauseStart, pauseStart)
 		lastPauseEnd = max(lastPauseEnd, pauseEnd)
 		
-		if(pauseStart < 0 || pauseEnd >= numpnts(traj)) //this shouldn't happen but does (pauseEnd<0)...
+		if(pauseStart < 0 || pauseEnd > numpnts(traj)-1) //this shouldn't happen but does (pauseEnd<0)...
 			return inf
+		endif
+		
+		if(pauseEnd==pauseStart) //don't do pause fit for zero-length pauses: These are changepoints and will be dealt with separately
+			continue
 		endif
 		
 		Variable wmean = getWeightedMean(pauseStart, pauseEnd)
 		fit[pauseStart,pauseEnd] = wmean
-		v_pausesOK = v_pausesOK || !numtype(wmean)
+		v_pausesOK = numtype(wmean) ? 0 : v_pausesOK
 	endfor
+	
+	if(!v_pausesOK)
+		return inf
+	endif
+
+	//--- Fit changepoint sections
+	Variable NzeroLengthPauses = 0
+	for(i=Npauses-1;i>=0;i-=1)
+		pauseStart = W_PausesUSED[i][0]
+		pauseEnd = pauseStart+W_PausesUSED[i][1]
+		
+		if(pauseEnd==pauseStart) //deal with changepoints
+			if(pauseStart<=0 || pauseEnd >= numpnts(traj)-1) //changepoints shouldn't be at ends
+				return inf
+			endif
+
+			//Find streches of changepoints: check if preceding pause is also a changepoint
+			Variable beginningOfChangepointStretch = i
+			Variable j
+			for(j=i;j>=0;j-=1)
+				if(W_PausesUSED[j][1] == 0)
+					beginningOfChangepointStretch = j
+					NzeroLengthPauses+=1
+				else
+					break
+				endif
+			endfor
+			
+			//Find out stretch to be fitted: End of last pause to beginning of next pause, or trajectoryEnds
+			Variable fitFromBeginning = beginningOfChangepointStretch==0
+			Variable fitToEnd = i==Npauses-1
+			
+			Variable fitFromPnt = fitFromBeginning ? 0               : W_PausesUSED[beginningOfChangepointStretch-1][0] + W_PausesUSED[beginningOfChangepointStretch-1][1]
+			Variable fitToPnt   = fitToEnd         ? numpnts(traj)-1 : W_PausesUSED[i+1][0]
+			
+			Variable pegFromPntY = fitFromBeginning ? NaN : fit[fitFromPnt]
+			Variable pegToPntY = fitToEnd ? NaN : fit[fitToPnt]
+			
+			////
+			Duplicate/O/FREE/R=[beginningOfChangepointStretch, i][0] W_PausesUSED, Changepoints
+			Redimension/N=(-1) Changepoints
+			if(wavemin(changepoints)<=0 || wavemax(changepoints) >= numpnts(traj)-1) //this check is still necessary even though I check individual pauses above. The check above doesn't check other pauses in the stretch.
+				return inf
+			endif
+			
+			//prepare waves
+			Duplicate/O/FREE/R=[fitFromPnt,fitToPnt] traj, traj_tmp
+			
+			if(useXwave)
+				Duplicate/O/FREE/R=[fitFromPnt,fitToPnt] xwave, xes
+				changepoints = xwave[changepoints]
+			else
+				Duplicate/O/FREE traj_tmp, xes
+				xes = pnt2x(xes,p)
+				changepoints = pnt2x(traj, changepoints)
+			endif
+			
+			Variable useSigmaInPWL1D_Core = 0
+			if(!useVarianceWave)
+				if(!numtype(noiseSigma) && noiseSigma>0)
+					Make/O/FREE/N=(numpnts(xes)) ww_sigmaWave = noiseSigma
+					useSigmaInPWL1D_Core = 1
+				else
+					Make/O/FREE/N=0 ww_sigmaWave //dummy
+					useSigmaInPWL1D_Core = 0
+				endif
+			else
+				Duplicate/O/FREE/R=[fitFromPnt,fitToPnt] variancewave, ww_sigmawave
+				ww_sigmawave = sqrt(ww_sigmawave)
+				useSigmaInPWL1D_Core = 1
+			endif
+				
+			//fit stretch of changepoints
+			Variable allok = PWL1D(xes, traj_tmp, ww_sigmaWave, useSigmaInPWL1D_Core, changepoints, "MYPFX", !fitfromBeginning, pegFromPntY, !fitToEnd, pegToPntY)
+			v_pausesOK = (allok && v_pausesOK) ? 1 : 0
+			if(!v_pausesOK)
+				return inf
+			endif
+			Wave MYPFX_fit
+			if(fitToPnt-fitFromPnt>numpnts(MYPFX_fit))
+				print "HERE", fitFromPnt, fitToPnt, numpnts(MYPFX_fit)
+				print w_pausesused
+			endif
+			fit[fitFromPnt,fitToPnt] = MYPFX_fit[p-fitFromPnt]
+			////
+			
+			//short-circuit: continue computing next stretch (if any)
+			i=beginningOfChangepointStretch
+		endif
+	endfor	
+	
+	
+	//TODO: HANDLE THIS CORRECLTY IN PRESENCE OF CHANGEPOINTS:
 	
 	//--- fit slopes (only first and last are truly "free")
 	Variable slope
@@ -117,13 +218,13 @@ Threadsafe Static Function GetSIC(Wave traj, Wave W_pauses [Variable noiseSigma,
 		endif
 	else
 		if(!v_pausesOK)
-			return NaN
+			return inf
 		endif
 		
 		
 		//---fit before first pause
 		Variable x0, y0
-		if(firstPauseStart != 0)
+		if(numtype(fit[0])) //is fit not done yet at the beginning?
 			if(useXwave)
 				x0 = xwave[firstPauseStart]
 			else
@@ -147,13 +248,15 @@ Threadsafe Static Function GetSIC(Wave traj, Wave W_pauses [Variable noiseSigma,
 			
 			slope = (COMY-y0)/(COMX-x0)
 #else			
-			Wave/SDFR=fld SlopeFromLeftEnd
-			slope = SlopeFromLeftEnd[firstPauseStart]
-			//slope = getSlope(traj,0,firstPauseStart, xwave=xwave)
+			if(useXwave)
+				slope = GetLeftSlope(traj, firstpauseStart, y0, xwave=xwave)
+			else
+				slope = GetLeftSlope(traj, firstpauseStart, y0)
+			endif
 #endif
 
 			if(numtype(slope))
-				return NaN
+				return inf
 			else
 				if(!useXwave)
 					//Multithread fit[0,firstPauseStart-1] = lineFitOffset({slope, x0, y0},x) //only fill first point: Interpolate2 below takes care of the rest (faster)
@@ -167,7 +270,7 @@ Threadsafe Static Function GetSIC(Wave traj, Wave W_pauses [Variable noiseSigma,
 		
 
 		//---fit after last pause
-		if(lastPauseEnd != numpnts(traj)-1)
+		if(numtype(fit[numpnts(traj)-1])) //is fit not done yet at the end?
 			if(useXwave)
 				x0 = xwave[lastPauseEnd]
 			else
@@ -191,12 +294,14 @@ Threadsafe Static Function GetSIC(Wave traj, Wave W_pauses [Variable noiseSigma,
 
 			slope = (COMY-y0)/(COMX-x0)
 #else
-			Wave/SDFR=fld SlopeFromRightEnd
-			slope = SlopeFromRightEnd[lastPauseEnd]
-			//slope = getSlope(traj,lastPauseEnd,numpnts(traj)-1, xwave=xwave)
+			if(useXwave)
+				slope = GetRightslope(traj, lastPauseEnd, y0, xwave=xwave)
+			else			
+				slope = GetRightslope(traj, lastPauseEnd, y0)
+			endif
 #endif
 			if(numtype(slope))
-				return NaN
+				return inf
 			else
 				if(!useXwave)
 					//Multithread fit[lastPauseEnd+1,] = lineFitOffset({slope, x0, y0},x)
@@ -219,12 +324,15 @@ Threadsafe Static Function GetSIC(Wave traj, Wave W_pauses [Variable noiseSigma,
 	
 	//------ Calculate SIC --------
 	//below: numpnts(traj) != n (!!!) 
-	if(Npauses>=2)
-		Variable Npar = Npauses + 2*(Npauses-1) + 2*(firstPauseStart != 0) + 2*(lastPauseEnd != numpnts(traj)-1) + 1 //1 for mean per pause, 2 DOFs for slopes in between (intercept+slope or times of two adjacent pauses), 2 each for flanking slopes, 1 for global variance
-	elseif(Npauses==1)
-		Npar = Npauses + 2*(firstPauseStart != 0) + 2*(lastPauseEnd != numpnts(traj)-1) + 1 //1 for pause mean, 1 each for potential flanking lines, 1 global variance
-	elseif(Npauses==0)
-		Npar = 2 + 1 //two for line fit + 1 for global variance
+
+	//internal regular non-zero-length pauses have 3 DOF (start, end,  mean)
+	//end non-zero-length pauses have 2 DOF (end, mean)
+	//zero-length pauses (changepoints) have 2 DOF (pos & height)
+	//internal slopes have 0 DOF (fully constrained)
+	//end-slopes, if present, have 1 DOF
+	//and add one for variance
+	if(Npauses>=0)
+		Variable Npar = 3*(Npauses-NzeroLengthPauses) + 2*(NzerolengthPauses) - (firstPauseStart==0) - (lastPauseEnd==numpnts(traj)-1) + (firstPauseStart!=0) + (lastPauseend!=numpnts(traj)-1) + 1
 	else
 		print "Error"
 		return NaN
@@ -297,96 +405,60 @@ Threadsafe Static Function SortPauses(Wave w)
 End
 
 
-//Threadsafe Static Function getSlope(Wave w, Variable fromPnt, Variable toPnt [, Wave xwave])
-//	Duplicate/O/FREE w, wX, wXY
-//	
-//	if(!paramisdefault(xwave) && waveExists(xwave))
-//		wX = !numtype(w) ? xwave[p] : NaN
-//	else
-//		wX = !numtype(w) ? x : NaN
-//	endif
-//	
-//	if(toPnt-fromPnt < 1)
-//		return NaN
-//	endif
-//	
-//	wXY = w*wX
-//	Wavestats/Q/M=0/R=[fromPnt,toPnt] w
-//	Variable SY = v_sum
-//	
-//	Wavestats/Q/M=0/R=[fromPnt,toPnt] wXY
-//	Variable SXY = v_sum
-//	
-//	Wavestats/Q/M=2/R=[fromPnt,toPnt] wX
-//	Variable SX = v_sum
-//	Variable SX2 = v_rms^2*v_npnts
-//	
-//	return (SXY-SX*SY/v_npnts)/(SX2-SX^2/v_npnts)
-//End
 
-
-Threadsafe Static Function getSlope(Wave w, Variable fromPnt, Variable toPnt [, Wave xwave, Wave varwave])
-    Duplicate/O/FREE w, wX, wXY
-    Redimension/D wX, wXY
-    Variable useWeights = !ParamIsDefault(varwave) && WaveExists(varwave)
-
-    if(!ParamIsDefault(xwave) && WaveExists(xwave))
-        wX = !numtype(w) ? xwave[p] : NaN
-    else
-        wX = !numtype(w) ? x : NaN
-    endif
-
-    if(toPnt - fromPnt < 1)
-        return NaN
-    endif
-
-    if(useWeights)
-        Duplicate/O/FREE w, wW, wWX, wWY, wWXY, wWX2
-        Redimension/D wW, wWX, wWY, wWXY, wWX2
-        wW   = (varwave[p] > 0 && !numtype(varwave[p])) ? 1/varwave[p] : NaN
-        wWX  = wW * wX
-        wWY  = wW * w
-        wWXY = wW * wX * w
-        wWX2 = wW * wX^2
-
-        Wavestats/Q/M=0/R=[fromPnt,toPnt] wW;   Variable SW   = V_sum
-        Wavestats/Q/M=0/R=[fromPnt,toPnt] wWX;  Variable SWX  = V_sum
-        Wavestats/Q/M=0/R=[fromPnt,toPnt] wWY;  Variable SWY  = V_sum
-        Wavestats/Q/M=0/R=[fromPnt,toPnt] wWXY; Variable SWXY = V_sum
-        Wavestats/Q/M=0/R=[fromPnt,toPnt] wWX2; Variable SWX2 = V_sum
-
-        return (SW*SWXY - SWX*SWY) / (SW*SWX2 - SWX^2)
-    else
-        wXY = w * wX
-        Wavestats/Q/M=0/R=[fromPnt,toPnt] w;   Variable SY = V_sum
-        Wavestats/Q/M=0/R=[fromPnt,toPnt] wXY; Variable SXY = V_sum
-        Wavestats/Q/M=2/R=[fromPnt,toPnt] wX
-        Variable SX = V_sum, SX2 = V_rms^2 * V_npnts
-
-        return (SXY - SX*SY/V_npnts) / (SX2 - SX^2/V_npnts)
-    endif
+Threadsafe Static Function GetLeftSlope(Wave w, Variable point, Variable pointY [, Wave xwave])
+	DFREF fld = root:Packages:FindPauses
+	
+	Wave/SDFR=fld SwW, SwWX, SwWY, SwWXY, SwWX2
+	
+	Variable useXwave   = !ParamIsDefault(xwave) && WaveExists(xwave)
+	
+	Variable x0 = useXwave ? xwave[point] : pnt2x(w, point)
+	Variable y0 = pointY
+	
+	Variable denom = SwWX2[point] - 2*x0*SwWX[point] + x0^2*SwW[point]
+	Variable numer = SwWXY[point] - y0*SwWX[point] - x0*SwWY[point] + x0*y0*SwW[point]
+	
+	return numer / denom
 End
 
 
-//Look-up table for end-slopes
+Threadsafe Static Function GetRightSlope(Wave w, Variable point, Variable pointY [, Wave xwave])
+	DFREF fld = root:Packages:FindPauses
+	
+	Wave/SDFR=fld RightSwW, RightSwWX, RightSwWY, RightSwWXY, RightSwWX2
+	
+	Variable useXwave   = !ParamIsDefault(xwave) && WaveExists(xwave)
+	
+	Variable x0 = useXwave ? xwave[point] : pnt2x(w, point)
+	Variable y0 = pointY
+	
+	Variable denom = RightSwWX2[point] - 2*x0*RightSwWX[point] + x0^2*RightSwW[point]
+	Variable numer = RightSwWXY[point] - y0*RightSwWX[point] - x0*RightSwWY[point] + x0*y0*RightSwW[point]
+	
+	return numer / denom
+End
+
+//Look-up table for suffix sums to compute end-slopes
 Threadsafe Static Function MakeEndSlopeLUT(Wave w [, Wave xwave, Wave variancewave])
 	DFREF fld = root:Packages:FindPauses
 	
 	Duplicate/O/FREE/D w, wX
+	
 	Variable useWeights = !ParamIsDefault(variancewave) && WaveExists(variancewave)
-	Variable useXwave = !ParamIsDefault(xwave) && WaveExists(xwave)
+	Variable useXwave   = !ParamIsDefault(xwave) && WaveExists(xwave)
 	
 	if(useXwave)
-	    wX = !numtype(w) ? xwave[p] : NaN
+		wX = !numtype(w) ? xwave[p] : NaN
 	else
-	    wX = !numtype(w) ? x : NaN
+		wX = !numtype(w) ? x : NaN
 	endif
-
+	
 	Duplicate/O/FREE w, wW, wWX, wWY, wWXY, wWX2
 	Redimension/D wW, wWX, wWY, wWXY, wWX2
-
+	
 	if(useWeights)
-		wW  = !numtype(variancewave[p]) && !numtype(w) ? 1/variancewave[p] : 0
+		wW = !numtype(variancewave[p]) && !numtype(w) ? 1/variancewave[p] : 0
 	else
 		wW = !numtype(w) ? 1 : 0
 	endif
@@ -395,43 +467,51 @@ Threadsafe Static Function MakeEndSlopeLUT(Wave w [, Wave xwave, Wave variancewa
 	wWY  = !numtype(w) ? wW * w : 0
 	wWXY = !numtype(w) ? wW * wX * w : 0
 	wWX2 = !numtype(w) ? wW * wX^2 : 0
-	
-	Duplicate/O/FREE/D wW, SwW
-	Duplicate/O/FREE/D wWX, SwWX
-	Duplicate/O/FREE/D wWY, SwWY
+
+	//---Left suffix sums
+	Duplicate/O/FREE/D wW,   SwW
+	Duplicate/O/FREE/D wWX,  SwWX
+	Duplicate/O/FREE/D wWY,  SwWY
 	Duplicate/O/FREE/D wWXY, SwWXY
 	Duplicate/O/FREE/D wWX2, SwWX2
+	
 	Integrate/P/METH=0 SwW, SwWX, SwWY, SwWXY, SwWX2
-	
-	Duplicate/O/D wW, fld:SlopeFromLeftEnd/Wave=SlopeFromLeftEnd
-	SlopeFromLeftEnd = (SwW*SwWXY - SwWX*SwWY) / (SwW*SwWX2 - SwWX^2)
-	
+
 	Duplicate/O SwW, fld:SwW   //store to compute weighted means
+	Duplicate/O SwWX, fld:SwWX //store to compute weighted means
 	Duplicate/O SwWY, fld:SwWY //store to compute weighted means
+	Duplicate/O SwWXY, fld:SwWXY //store to compute weighted means
+	Duplicate/O SwWX2, fld:SwWX2 //store to compute weighted means
 	
-
-//Duplicate/O/D wW, SlopeFromRightEnd
-//slopefromrightend=nan
-//Variable l = numpnts(w)-1
-//SlopeFromRightEnd[1,] = ((SwW[l]-SwW[p-1])*(SwWXY[l]-SwWXY[p-1]) - (SwWX[l]-SwWX[p-1])*(SwWY[l]-SwWY[p-1])) / ((SwW[l]-SwW[p-1])*(SwWX2[l]-SwWX2[p-1]) - (SwWX[l]-SwWX[p-1])^2)
-
-	//Because of numerical errors, I'll have to do it with reversal for computing from the other end. End-Integral gives slightly incorrect results just where I need accuracy.
-	Duplicate/O/FREE/D wW, SwW
-	Duplicate/O/FREE/D wWX, SwWX
-	Duplicate/O/FREE/D wWY, SwWY
+	//---Right suffix sums
+	// Build suffix sums by flipping, integrating, then flipping back.
+	Duplicate/O/FREE/D wW,   SwW
+	Duplicate/O/FREE/D wWX,  SwWX
+	Duplicate/O/FREE/D wWY,  SwWY
 	Duplicate/O/FREE/D wWXY, SwWXY
 	Duplicate/O/FREE/D wWX2, SwWX2
-	Wavetransform	/O flip SwW
-	Wavetransform	/O flip SwWX
-	Wavetransform	/O flip SwWY
-	Wavetransform	/O flip SwWXY
-	Wavetransform	/O flip SwWX2
+	
+	WaveTransform/O flip SwW
+	WaveTransform/O flip SwWX
+	WaveTransform/O flip SwWY
+	WaveTransform/O flip SwWXY
+	WaveTransform/O flip SwWX2
+	
 	Integrate/P/METH=0 SwW, SwWX, SwWY, SwWXY, SwWX2
+	
+	WaveTransform/O flip SwW
+	WaveTransform/O flip SwWX
+	WaveTransform/O flip SwWY
+	WaveTransform/O flip SwWXY
+	WaveTransform/O flip SwWX2
 
-	Duplicate/O/D wW, fld:SlopeFromRightEnd/Wave=SlopeFromRightEnd
-	SlopeFromRightEnd = (SwW*SwWXY - SwWX*SwWY) / (SwW*SwWX2 - SwWX^2)
-	Wavetransform	/O flip SlopeFromRightEnd
+	Duplicate/O SwW, fld:RightSwW   //store to compute weighted means
+	Duplicate/O SwWX, fld:RightSwWX //store to compute weighted means
+	Duplicate/O SwWY, fld:RightSwWY //store to compute weighted means
+	Duplicate/O SwWXY, fld:RightSwWXY //store to compute weighted means
+	Duplicate/O SwWX2, fld:RightSwWX2 //store to compute weighted means
 End
+
 
 
 Threadsafe Static Function GetWeightedMean(Variable fromPnt, Variable toPnt)
@@ -449,11 +529,14 @@ End
 ///////////////////////////////// MCMC Version ///////////////////////////////////
 //Do multiple runs with different random seeds
 
-Function/WAVE FindPausesMCMC_MT(Wave traj [,Variable maxCountsSinceLastBest, Variable noiseSigma, Wave xwave, Variable randomseed, Wave sigmaWave, Variable Nruns, Variable quiet])
+Function/WAVE FindPausesMCMC_MT(Wave traj [,Variable maxCountsSinceLastBest, Variable noiseSigma, Wave xwave, Variable randomseed, Wave sigmaWave, Variable Nruns, Variable allowChangePoints, Variable onlyChangePoints, Variable quiet])
 	maxCountsSinceLastBest = paramisdefault(maxCountsSinceLastBest) ? max(2000, dimsize(traj,0)*15) : maxCountsSinceLastBest //stop criterium. Bigger for better and slower.
 	Nruns = paramisdefault(Nruns) ? 1 : Nruns
 	randomseed = paramisdefault(randomseed) ? 0.1 : randomseed //default:reproducible
+	allowChangePoints = paramisdefault(allowChangePoints) ? 0 : allowChangePoints
+	onlyChangePoints = paramisdefault(onlyChangePoints) ? 0 : onlyChangePoints
 	quiet = paramisdefault(quiet) ? 0 : quiet
+	noiseSigma = paramisdefault(noiseSigma) ? NaN : noiseSigma
 	
 	if(Nruns<1)
 		abort "Illegal Nruns"
@@ -480,7 +563,7 @@ Function/WAVE FindPausesMCMC_MT(Wave traj [,Variable maxCountsSinceLastBest, Var
 		endif
 		
 		//start thread
-		ThreadStart threadGroupID, threadIdx, FindPausesMCMC_singlerun(traj, maxCountsSinceLastBest, noiseSigma, xwave, enoise(.5)+.5, sigmaWave, 1, 1)
+		ThreadStart threadGroupID, threadIdx, FindPausesMCMC_singlerun(traj, maxCountsSinceLastBest, noiseSigma, xwave, enoise(.5)+.5, sigmaWave, 1, 1, allowChangePoints, onlyChangePoints)
 	endfor
 	
 	//wait for all to finish
@@ -515,7 +598,6 @@ Function/WAVE FindPausesMCMC_MT(Wave traj [,Variable maxCountsSinceLastBest, Var
 	
 	//Analyze result and print
 	if(!paramisdefault(sigmawave) && WaveExists(sigmawave))
-		//abort "Not implemented yet. This is more difficult than I thought. Need to fix fitting (weighted avg) and end-slopes, as well as maxLik."
 		Duplicate/O/FREE sigmawave, variancewave
 		variancewave = !numtype(traj) ? sigmawave^2 : NaN
 
@@ -529,7 +611,7 @@ Function/WAVE FindPausesMCMC_MT(Wave traj [,Variable maxCountsSinceLastBest, Var
 
 	Wave/SDFR=fld W_Pauses
 	Variable Npauses = dimsize(W_Pauses,0)
-	SIC = GetSIC(traj, W_Pauses, noiseSigma=noiseSigma, xwave=xwave, variancewave=variancewave, sum_ln2piVariances=sum_ln2piVariances)
+	Variable bestSIC = GetSIC(traj, W_Pauses, noiseSigma=noiseSigma, xwave=xwave, variancewave=variancewave, sum_ln2piVariances=sum_ln2piVariances)
 	NVAR NoiseSigmaEstimated = fld:noiseSigmaEstimated, NoiseSigmaOutput=fld:NoiseSigma, redChisq=fld:redChisq
 	if(Npauses==1 && W_Pauses[0][0] == 0 && W_Pauses[0][1] == dimsize(traj,0)-1)
 		String notice = "[Only one pause => Is static]"
@@ -541,8 +623,19 @@ Function/WAVE FindPausesMCMC_MT(Wave traj [,Variable maxCountsSinceLastBest, Var
 		notice = ""
 	endif
 	
+	Variable Nchangepoints = 0
+	for(i=0;i<Npauses;i+=1)
+		if(W_Pauses[i][1] == 0)
+			Nchangepoints += 1
+		endif
+	endfor
+	
 	if(!quiet)
-		printf "%d pause(s) found. SIC=%f, noiseSigmaEst=%f, noiseSigma=%f, redChisq=%f %s\r", Npauses, SIC, NoiseSigmaEstimated, NoiseSigmaOUtput, redchisq, notice
+		String changepointString = ""
+		if(Nchangepoints>0)
+			sprintf changepointString, " (thereof %d change point(s))", Nchangepoints
+		endif
+		printf "%d pause(s)%s found. SIC=%f, noiseSigmaEst=%f, noiseSigma=%f, redChisq=%f %s\r", Npauses, changepointString, bestSIC, NoiseSigmaEstimated, NoiseSigmaOUtput, redchisq, notice
 	endif
 		
 	return fld:W_pauses	
@@ -551,11 +644,14 @@ End
 
 
 
-Function/Wave FindPausesMCMC(Wave traj [,Variable maxCountsSinceLastBest, Variable noiseSigma, Wave xwave, Variable randomseed, Wave sigmaWave, Variable Nruns, Variable quiet])
+Function/Wave FindPausesMCMC(Wave traj [,Variable maxCountsSinceLastBest, Variable noiseSigma, Wave xwave, Variable randomseed, Wave sigmaWave, Variable Nruns, Variable allowChangePoints, Variable onlyChangePoints, Variable quiet])
 	maxCountsSinceLastBest = paramisdefault(maxCountsSinceLastBest) ? max(2000, dimsize(traj,0)*5) : maxCountsSinceLastBest //stop criterium. Bigger for better and slower.
 	Nruns = paramisdefault(Nruns) ? 1 : Nruns
 	randomseed = paramisdefault(randomseed) ? 0.1 : randomseed //default:reproducible
+	allowChangePoints = paramisdefault(allowChangePoints) ? 0 : allowChangePoints
+	onlyChangePoints = paramisdefault(onlyChangePoints) ? 0 : onlyChangePoints
 	quiet = paramisdefault(quiet) ? 0 : quiet
+	noiseSigma = paramisdefault(noiseSigma) ? NaN : noiseSigma
 	
 	if(Nruns<1)
 		abort "Illegal Nruns"
@@ -574,7 +670,7 @@ Function/Wave FindPausesMCMC(Wave traj [,Variable maxCountsSinceLastBest, Variab
 		NewDataFolder root:TMP
 		Variable i
 		for(i=0;i<Nruns;i+=1)
-			FindPausesMCMC_singlerun(traj, maxCountsSinceLastBest, noiseSigma, xwave, enoise(.5)+.5, sigmaWave, 1, 0)
+			FindPausesMCMC_singlerun(traj, maxCountsSinceLastBest, noiseSigma, xwave, enoise(.5)+.5, sigmaWave, 1, 0, allowChangePoints, onlyChangePoints)
 			NVAR/SDFR=fld SIC
 			
 			DuplicateDataFolder fld, $("root:TMP:RUN_"+num2istr(i))
@@ -612,7 +708,7 @@ Function/Wave FindPausesMCMC(Wave traj [,Variable maxCountsSinceLastBest, Variab
 
 	Wave/SDFR=fld W_Pauses
 	Variable Npauses = dimsize(W_Pauses,0)
-	SIC = GetSIC(traj, W_Pauses, noiseSigma=noiseSigma, xwave=xwave, variancewave=variancewave, sum_ln2piVariances=sum_ln2piVariances)
+	Variable bestSIC = GetSIC(traj, W_Pauses, noiseSigma=noiseSigma, xwave=xwave, variancewave=variancewave, sum_ln2piVariances=sum_ln2piVariances)
 	NVAR NoiseSigmaEstimated = fld:noiseSigmaEstimated, NoiseSigmaOutput=fld:NoiseSigma, redChisq=fld:redChisq
 	if(Npauses==1 && W_Pauses[0][0] == 0 && W_Pauses[0][1] == dimsize(traj,0)-1)
 		String notice = "[Only one pause => Is static]"
@@ -624,8 +720,19 @@ Function/Wave FindPausesMCMC(Wave traj [,Variable maxCountsSinceLastBest, Variab
 		notice = ""
 	endif
 	
+	Variable Nchangepoints = 0
+	for(i=0;i<Npauses;i+=1)
+		if(W_Pauses[i][1] == 0)
+			Nchangepoints += 1
+		endif
+	endfor
+	
 	if(!quiet)
-		printf "%d pause(s) found. SIC=%f, noiseSigmaEst=%f, noiseSigma=%f, redChisq=%f %s\r", Npauses, SIC, NoiseSigmaEstimated, NoiseSigmaOUtput, redchisq, notice
+		String changepointString = ""
+		if(Nchangepoints>0)
+			sprintf changepointString, " (thereof %d change point(s))", Nchangepoints
+		endif
+		printf "%d pause(s)%s found. SIC=%f, noiseSigmaEst=%f, noiseSigma=%f, redChisq=%f %s\r", Npauses, changepointString, bestSIC, NoiseSigmaEstimated, NoiseSigmaOUtput, redchisq, notice
 	endif
 
 	//re-seed RNG
@@ -640,7 +747,7 @@ End
 // - Zero-length pauses are fishy (change points). Unclear how to deal with them. Currently disallowing!!!. They will always sit exactly on data points (see GetSIC()). So this isn't a true change-point analysis.
 // - xwave: optional x-wave for traj. If not given, wave scaling is used.
 // - Fitting starts with no pause, then the first move is hard-coded to birth a pause that encompasses the entire traj. This way, the "static" and "moving" conditions are always tested.
-Threadsafe Static Function FindPausesMCMC_singlerun(Wave traj, Variable maxCountsSinceLastBest, Variable noiseSigma, Wave xwave, Variable randomSeed, Wave sigmaWave, Variable quiet, Variable isThread)
+Threadsafe Static Function FindPausesMCMC_singlerun(Wave traj, Variable maxCountsSinceLastBest, Variable noiseSigma, Wave xwave, Variable randomSeed, Wave sigmaWave, Variable quiet, Variable isThread, Variable allowChangePoints, Variable onlyChangePoints)
 
 	NewDataFolder/O root:packages
 	NewDataFolder/O root:packages:FindPauses
@@ -652,7 +759,6 @@ Threadsafe Static Function FindPausesMCMC_singlerun(Wave traj, Variable maxCount
 		Duplicate/O xwave, fld:xwave
 	endif
 	if(WaveExists(sigmawave))
-		//abort "Not implemented yet. This is more difficult than I thought. Need to fix fitting (weighted avg) and end-slopes, as well as maxLik."
 		Duplicate/O/FREE sigmawave, variancewave
 		variancewave = !numtype(traj) ? sigmawave^2 : NaN
 
@@ -661,18 +767,20 @@ Threadsafe Static Function FindPausesMCMC_singlerun(Wave traj, Variable maxCount
 		Wavestats/Q/M=1 ln2piVariances
 		Variable sum_ln2piVariances = v_sum
 	else
+		Wave variancewave = $""
 		sum_ln2piVariances = NaN
 	endif
 	MakeEndSlopeLUT(traj, xwave=xwave, variancewave=variancewave)
 	
 	SetRandomSeed randomseed
 	
-	Variable NMOVES = 6 //birth, death, changeLength, split, merge, fillToEnd, (changeLengthMinimal)
+	Variable NMOVES = 8 //birth, death, changeLength, split, merge, fillToEnd, SplitToChangepoints, Move(changeLengthMinimal)
 	
+	Variable docp = (!!allowChangePoints) || (!!onlyChangePoints)
 	Make/O/N=(NMOVES, 3) fld:P_MOVE/Wave=P_MOVE = 0 //second index: 0: no pauses, 1: one pause, 2: two pauses or more
-	P_MOVE[][0] = {1,0,0,0,0,0}                     //zero pauses: only birth allowed
-	P_MOVE[][1] = {1,1,1,.1,0,.05}                  //one pause: no merge
-	P_MOVE[][2] = {.8, .2, 1, .1, .1, .02}          //two pauses or more: all allowed
+	P_MOVE[][0] = {1,0,0,0,0,0,0,0}                     //zero pauses: only birth allowed
+	P_MOVE[][1] = {1,1,1,.1,0,.05,.05*docp,1}                  //one pause: no merge
+	P_MOVE[][2] = {.8, .5, 1, .1, .1, .02, .02*docp,1}          //two pauses or more: all allowed
 	MatrixOp/O P_MOVE = P_MOVE / RowRepeat(sumcols(P_MOVE), NMOVES) //Normalize P_MOVE
 
 	Duplicate/O P_MOVE, fld:CUM_P_MOVE/Wave = CUM_P_MOVE
@@ -690,7 +798,9 @@ Threadsafe Static Function FindPausesMCMC_singlerun(Wave traj, Variable maxCount
 	SetDimLabel 0, 3, Split, Movestats
 	SetDimLabel 0, 4, Merge, Movestats
 	SetDimlabel 0, 5, FillToEnd, Movestats
-	//SetDimLabel 0, 6, ChangeLengthMinimal, Movestats
+	SetDimlabel 0, 6, SplitToChangepoints, Movestats
+	SetDimLabel 0, 7, Move, Movestats
+	//SetDimLabel 0, 7, ChangeLengthMinimal, Movestats
 	SetDimLabel 1, 0, Accept, Movestats
 	SetDimLabel 1, 1, Reject, Movestats
 	SetDimLabel 1, 2, InfFW, Movestats
@@ -700,7 +810,8 @@ Threadsafe Static Function FindPausesMCMC_singlerun(Wave traj, Variable maxCount
 	
 	//---Initialize
 	Duplicate/O W_CurrentPauses, fld:W_Pauses
-	Variable lnp_w_given_Y = -GetSIC(W_traj, W_CurrentPauses, noiseSigma=noiseSigma, xwave=xwave, variancewave=variancewave, sum_ln2piVariances=sum_ln2piVariances)	
+	Cache_Make("SIC", 200)
+	Variable lnp_w_given_Y = -GetSIC_Cached(W_traj, W_CurrentPauses, noiseSigma=noiseSigma, xwave=xwave, variancewave=variancewave, sum_ln2piVariances=sum_ln2piVariances)	
 	InsertPoints/V=(lnp_w_given_Y) numpnts(timeline), 1, timeline
 	Duplicate/O fld:fit, fld:bestFit/Wave=bestfit, fld:bestFit_colorwave/Wave=bestfit_colorwave, fld:bestfit_residuals/Wave=bestfit_residuals
 	bestfit_colorwave = 0
@@ -723,7 +834,7 @@ Threadsafe Static Function FindPausesMCMC_singlerun(Wave traj, Variable maxCount
 	for(counter=0;;counter+=1)
 		Variable move = SelectMove(CUM_P_MOVE, W_CurrentPauses)
 
-		if(counter==0)
+		if(counter==0 && onlyChangepoints==0)
 			move = -1 //special move first: full pause
 		endif
 
@@ -871,8 +982,49 @@ Threadsafe Static Function FindPausesMCMC_singlerun(Wave traj, Variable maxCount
 				lnProposal_wp_given_w += ln(Get_P_Move(W_CurrentPauses, 5))
 				lnProposal_w_given_wp += ln(Get_P_Move(W_ProposedPauses, 2))
 				break
+				
+			case 6: //----- SPLITTOCHANGEPOINTS ------
+				lnProposal_wp_given_w = Move_SplitToChangepoints(W_traj, W_CurrentPauses)
+				Wave/SDFR=fld W_ProposedPauses
+				
+				if(lnProposal_wp_given_w == -inf)
+					Movestats[move][%InfFW] += 1
+					break
+				endif
+	
+				lnProposal_w_given_wp = lnP_merge(W_traj, W_ProposedPauses)
+	
+				if(lnProposal_w_given_wp == -inf)
+					Movestats[move][%InfRev] += 1
+					break
+				endif
+	
+				lnProposal_wp_given_w += ln(Get_P_Move(W_CurrentPauses, 6))
+				lnProposal_w_given_wp += ln(Get_P_Move(W_ProposedPauses, 4))
+				break
 
-//			case 6: //----- CHANGELENGTHMINIMAL ------
+			case 7: //----- MOVE ------
+				lnProposal_wp_given_w = Move_Move(W_traj, W_CurrentPauses)
+				Wave/SDFR=fld W_ProposedPauses
+				NVAR/SDFR=fld MOVE_INDEX
+				
+				if(lnProposal_wp_given_w == -inf)
+					Movestats[move][%InfFW] += 1
+					break
+				endif
+	
+				lnProposal_w_given_wp = lnP_Move(W_traj, W_ProposedPauses, MOVE_INDEX)
+	
+				if(lnProposal_w_given_wp == -inf)
+					Movestats[move][%InfRev] += 1
+					break
+				endif
+	
+				lnProposal_wp_given_w += ln(Get_P_Move(W_CurrentPauses, 7))
+				lnProposal_w_given_wp += ln(Get_P_Move(W_ProposedPauses, 7))
+				break
+				
+//			case 8: //----- CHANGELENGTHMINIMAL ------
 //				lnProposal_wp_given_w = Move_ChangeLengthMinimal(W_traj, W_CurrentPauses)
 //				Wave/SDFR=fld W_ProposedPauses
 //				NVAR/SDFR=fld CHANGELENGTH_INDEX, CHANGELENGTH_SIDE
@@ -889,12 +1041,39 @@ Threadsafe Static Function FindPausesMCMC_singlerun(Wave traj, Variable maxCount
 //					break
 //				endif
 //	
-//				lnProposal_wp_given_w += ln(Get_P_Move(W_CurrentPauses, 6))
-//				lnProposal_w_given_wp += ln(Get_P_Move(W_ProposedPauses, 6))
+//				lnProposal_wp_given_w += ln(Get_P_Move(W_CurrentPauses, 8))
+//				lnProposal_w_given_wp += ln(Get_P_Move(W_ProposedPauses, 8))
 //				break
 
 		endswitch
 		
+		//Check if proposals are allowed by the settings
+		if(onlyChangePoints)
+			allowChangePoints = 1
+		endif
+
+		if(allowChangePoints==0)		
+			//Reject zero-length pauses
+			if(dimsize(W_proposedPauses,0)>0)
+				Wavestats/Q/RMD=[][1] W_proposedPauses
+				if(v_min==0)
+					counter -= 1
+					continue
+				endif
+			endif
+		endif
+
+		if(onlyChangePoints==1)
+			//Reject all non-changepoints
+			if(move!=-1 && dimsize(W_proposedPauses,0)>0) 
+				Wavestats/Q/RMD=[][1] W_proposedPauses
+				if(v_max>0)
+					counter -= 1
+					continue
+				endif
+			endif
+		endif
+
 		//HACKY: move=-1 is special and will cause problems below. Set it to a "normal" birth move
 		move = move==-1 ? 0 : move
 
@@ -902,17 +1081,8 @@ Threadsafe Static Function FindPausesMCMC_singlerun(Wave traj, Variable maxCount
 			counter -= 1
 			continue
 		endif
-		
-		//Reject zero-length pauses
-		if(dimsize(W_proposedPauses,0)>0)
-			Wavestats/Q/RMD=[][1] W_proposedPauses
-			if(v_min==0)
-				counter -= 1
-				continue
-			endif
-		endif
 
-		lnp_wp_given_Y = -GetSIC(W_traj, W_ProposedPauses, noiseSigma=noiseSigma, xwave=xwave, variancewave=variancewave, sum_ln2piVariances=sum_ln2piVariances) //calculate posterior			
+		lnp_wp_given_Y = -GetSIC_Cached(W_traj, W_ProposedPauses, noiseSigma=noiseSigma, xwave=xwave, variancewave=variancewave, sum_ln2piVariances=sum_ln2piVariances) //calculate posterior			
 
 		Variable decision = MetropolisHastingsA(lnp_wp_given_Y, lnProposal_w_given_wp, lnp_w_given_Y, lnProposal_wp_given_w)
 
@@ -963,6 +1133,17 @@ Threadsafe Static Function FindPausesMCMC_singlerun(Wave traj, Variable maxCount
 	Wave/SDFR=fld W_Pauses
 	Variable Npauses = dimsize(W_Pauses,0)
 	Variable SIC = GetSIC(W_traj, W_Pauses, noiseSigma=noiseSigma, xwave=xwave, variancewave=variancewave, sum_ln2piVariances=sum_ln2piVariances)
+	//--Regenerate
+	Wave/SDFR=fld fit
+	Duplicate/O fit, fld:bestFit/Wave=bestfit
+	Duplicate/O fit, fld:bestfit_colorwave/Wave=bestfit_colorwave, fld:bestfit_residuals/Wave=bestfit_residuals
+	bestfit_colorwave = 0
+	bestfit_residuals = W_traj-bestfit
+	for(ii=0;ii<dimsize(W_Pauses,0);ii+=1)
+		bestfit_colorwave[W_Pauses[ii][0],max(0,W_Pauses[ii][0]+W_Pauses[ii][1]-1)] = 1
+	endfor
+
+
 	NVAR NoiseSigmaEstimated = fld:noiseSigmaEstimated, NoiseSigmaOutput=fld:NoiseSigma, redChisq=fld:redChisq
 	if(Npauses==1 && W_Pauses[0][0] == 0 && W_Pauses[0][1] == dimsize(W_traj,0)-1)
 		String notice = "[Only one pause => Is static]"
@@ -982,6 +1163,8 @@ Threadsafe Static Function FindPausesMCMC_singlerun(Wave traj, Variable maxCount
 	
 	//re-seed RNG
 	SetRandomSeed (ticks + trunc(1e6*abs(enoise(1))))/1e9
+
+	Cache_Clear("SIC")
 
 	if(isThread)
 		Waveclear W_pauses, bestfit_residuals, bestfit_colorwave, bestfit, fit, w_proposedPauses, w_currentPauses, CUM_P_MOVE, P_MOVE, w_traj, timeline, movestats //clear all references for ThreadGroupPutDF
@@ -1169,8 +1352,6 @@ Threadsafe Static Function LnP_ChangeLength(Wave W_traj, Wave W_CurrentPauses, V
 	return lnP
 end
 
-
-
 //Static Constant CHANGELENGTH_CHARACTERISTICLENGTH = 3 //points
 
 Threadsafe Static Function Move_ChangeLengthMinimal(Wave W_traj, Wave W_CurrentPauses)
@@ -1254,7 +1435,71 @@ end
 
 
 
+Threadsafe Static Function Move_Move(Wave W_traj, Wave W_CurrentPauses)
+	DFREF fld = root:Packages:FindPauses
+	
+	Variable lnP = 0
+	
+	Variable N = numpnts(W_traj)
+	Variable Npauses = Dimsize(W_CurrentPauses,0)
+	if(Npauses==0)
+		return -inf
+	endif
+	
+	//--Pick random pause
+	Variable index = IntNoise(0, Npauses-1)
+	Variable/G fld:MOVE_INDEX = index
+	lnP -= ln(Npauses)
+	
+	//--Pick direction (+1: right, -1: left)
+	Variable direction = enoise(1)>0 ? 1 : -1
+	Variable/G fld:MOVE_DIRECTION = direction
+	lnP -= ln(2)
+		
+	//--Generate Proposal
+	Duplicate/O W_CurrentPauses, fld:W_ProposedPauses/Wave=W_ProposedPauses
+	Variable startOfThisPause = W_CurrentPauses[index][0]
+	Variable lengthOfThisPause = W_CurrentPauses[index][1]
+	Variable startOfNextPause = index<Npauses-1 ? W_CurrentPauses[index+1][0] : N
+	Variable endOfPreviousPause = index>0 ? W_CurrentPauses[index-1][0]+W_CurrentPauses[index-1][1] : -1
 
+	Variable newStart = startOfThisPause + direction
+	if(newStart<endOfPreviousPause+1 || newStart > startOfNextPause-LengthOfThisPause-1)
+		return -inf
+	endif		
+//	Variable newStart = IntNoise(endOfPreviousPause+1, startOfNextPause-lengthOfThisPause-1)
+//	lnP -= ln((startOfNextPause-lengthOfThisPause-1)-(endOfPreviousPause+1))
+	
+	W_ProposedPauses[index][0] = newStart
+	
+	return lnP
+end
+
+Threadsafe Static Function LnP_Move(Wave W_traj, Wave W_CurrentPauses, Variable index)
+	DFREF fld = root:Packages:FindPauses
+	
+	Variable lnP = 0
+	
+	Variable N = numpnts(W_traj)
+	Variable Npauses = Dimsize(W_CurrentPauses,0)
+	if(Npauses==0)
+		return -inf
+	endif
+	
+	//--Pick random pause
+	lnP -= ln(Npauses)
+
+	//--Pick direction (+1: right, -1: left)
+	lnP -= ln(2)
+	
+//	Variable startOfThisPause = W_CurrentPauses[index][0]
+//	Variable lengthOfThisPause = W_CurrentPauses[index][1]
+//	Variable startOfNextPause = index<Npauses-1 ? W_CurrentPauses[index+1][0] : N
+//	Variable endOfPreviousPause = index>0 ? W_CurrentPauses[index-1][0]+W_CurrentPauses[index-1][1] : -1
+//	lnP -= ln((startOfNextPause-lengthOfThisPause-1)-(endOfPreviousPause+1))
+
+	return lnP
+end
 
 
 //randomly select first or last pause, then make pause go from the start or to the end.
@@ -1445,6 +1690,70 @@ end
 
 
 
+
+Threadsafe Static Function Move_SplitToChangepoints(Wave W_traj, Wave W_CurrentPauses)
+	DFREF fld = root:Packages:FindPauses
+	
+	Variable lnP = 0
+	
+	Variable N = numpnts(W_traj)
+	Variable Npauses = Dimsize(W_CurrentPauses,0)
+	if(Npauses==0)
+		return -inf
+	endif
+	
+	//--Pick random pause
+	Variable index = IntNoise(0, Npauses-1)
+	lnP -= ln(Npauses)
+	
+	Variable CurrentLength = W_CurrentPauses[index][1]
+	if(CurrentLength==0)
+		return -inf
+	endif
+
+	//--Generate Proposal
+	Duplicate/O W_CurrentPauses, fld:W_ProposedPauses/Wave=W_ProposedPauses
+	
+	//Pick new length first pause
+	Variable firstStart = W_CurrentPauses[index][0]
+	Variable firstLength = 0
+	
+	//Pick new start of second pause
+	Variable secondStart = W_CurrentPauses[index][0]+CurrentLength
+	Variable secondLength = 0
+
+	W_ProposedPauses[index][0] = firstStart
+	W_ProposedPauses[index][1] = firstLength
+	
+	InsertPoints/M=0 index+1, 1, W_ProposedPauses
+	W_ProposedPauses[index+1][0] = secondStart
+	W_ProposedPauses[index+1][1] = secondLength
+	
+	return lnP
+end
+
+Threadsafe Static Function LnP_SplitToChangepoints(Wave W_traj, Wave W_CurrentPauses, Variable LengthOfMergedPause, Variable LengthOfFirstPause)
+	DFREF fld = root:Packages:FindPauses
+	
+	Variable lnP = 0
+	
+	Variable N = numpnts(W_traj)
+	Variable Npauses = Dimsize(W_CurrentPauses,0)
+	if(Npauses==0)
+		return -inf
+	endif
+	
+	//--Pick random pause
+	lnP -= ln(Npauses)
+	
+	if(LengthOfMergedPause==0)
+		return -inf
+	endif
+
+	return lnP
+end
+
+
 Threadsafe Static Function SelectMove(Wave CUM_P_MOVE, Wave W_Pauses)
 	Variable Npauses = dimsize(W_Pauses,0)
 
@@ -1542,3 +1851,478 @@ Threadsafe Static Function RandomIndexFromCDF(Wave CDF) //randomly pick from CDF
 	Wavestats/Q/M=0 select
 	return v_maxloc //ATTENTION: THIS ACTUALLY RETURNS THE SCALED POSITION AND NOT THE INDEX
 End
+
+
+
+
+//////////////// Change point fitting routines
+
+//Threadsafe Function PWL1D_Core(Wave wT, Wave wY, Wave wSigma, Variable useSigma, Wave bpW, String outPrefix, Variable pegFirst, Variable pegFirstY, Variable pegLast, Variable pegLastY)
+//End
+
+
+//PROFILING
+Function pprof()
+	Wave traj, xes, w_sigma, breakpoints
+	Wave w_pauses = root:packages:findPauses:w_pauses
+	Duplicate/O/R=[][0] w_pauses, breakpoints
+	Redimension/N=(-1) breakpoints
+	breakpoints = pnt2x(traj, breakpoints[p])
+	xes = pnt2x(traj, p)
+	
+	Variable i
+	for(i=0;i<1000;i+=1)
+//		PWL1D(xes, traj, w_sigma, 0, breakpoints, "MYPFX", 1, 0, 1, 0)
+	endfor
+End
+
+
+Function ppprof()
+	Wave traj
+	findpausesmcmc_mt(traj)
+End
+
+
+// 1D continuous piecewise-linear fit with fixed breakpoints,
+// optional y uncertainties, NaN handling, and optional endpoint pegs (to make continuous with adjacent pauses)
+//
+// Model:
+//   y(t) = beta0 + beta1*t + sum_k gamma[k]*max(0, t - bp[k])
+// bpW are times, not point indices!
+Threadsafe Static Function PWL1D(Wave wT, Wave wY, Wave wSigma, Variable useSigma, Wave bpW, String outPrefix, Variable pegFirst, Variable pegFirstY, Variable pegLast, Variable pegLastY)
+//Function PWL1D_Core2(Wave wT, Wave wY, Wave wSigma, Variable useSigma, Wave bpW, String outPrefix, Variable pegFirst, Variable pegFirstY, Variable pegLast, Variable pegLastY)
+	Variable n = numpnts(wT)
+	Variable nbp = numpnts(bpW)
+	Variable nCoef = nbp + 2
+	Variable i, j, k
+	
+	if(n!=numpnts(wY))
+		print "wT and wY must have the same number of points."
+		return 0
+	endif
+	
+	if(useSigma)
+		if(n!=numpnts(wSigma))
+			print "wSigma must have the same number of points as wT and wY."
+			return 0
+		endif
+	endif
+	
+	Variable doPegFirst = (pegFirst != 0)
+	Variable doPegLast  = (pegLast  != 0)
+	
+	if(doPegFirst && numtype(pegFirstY))
+		print "pegFirstY must be finite when pegFirst is enabled."
+		return 0
+	endif
+	
+	if(doPegLast && numtype(pegLastY))
+		print "pegLastY must be finite when pegLast is enabled."
+		return 0
+	endif
+	
+	Variable firstT = wT[0]
+	Variable lastT  = wT[numpnts(wT)-1]
+	
+	Variable nPeg = doPegFirst + doPegLast
+	
+	// Collect valid data points
+	Make/FREE/D/N=(n) tValid, yValid, sigmaValid
+	Variable nValid=0
+	Variable ok, sig
+
+	for(i=0;i<n;i+=1)
+		ok = !numtype(wY[i])
+		
+		if(useSigma)
+			sig = wSigma[i]
+			ok = ok && !numtype(sig) && (sig > 0)
+		else
+			sig = 1
+		endif
+		
+		if(ok)
+			tValid[nValid] = wT[i]
+			yValid[nValid] = wY[i]
+			sigmaValid[nValid] = sig
+			nValid+=1
+		endif
+	endfor
+
+    Redimension/N=(nValid) tValid, yValid, sigmaValid
+
+    // Need enough information after adding exact constraints
+    if((nValid+nPeg) < nCoef)
+		//print "Not enough valid data points plus endpoint constraints for this number of breakpoints."
+		return 0
+    endif
+
+    // Weighted design matrix and RHS
+    Make/FREE/D/N=(nValid, nCoef) Design=0
+    Make/FREE/D/N=(nValid, 1) RHS
+
+	if(useSigma)
+		Design[][0] = 1/sigmaValid[p]
+		Design[][1] = tValid[p]/sigmaValid[p]
+		
+		for(k=0;k<nbp;k+=1)
+			Variable tau = bpW[k]
+//			Design[][k+2] = ((tValid[p] > tau) ? (tValid[p] - tau) : 0)/sigmaValid[p]
+			Variable firstRow = PWL1D_FirstGreaterBinary(tValid, tau)
+			
+			if(firstRow<nValid)
+				Design[firstRow,nValid-1][k+2] = (tValid[p] - tau)/sigmaValid[p]
+			endif
+		endfor
+		
+		RHS[][0] = yValid[p]/sigmaValid[p]
+	else
+		Design[][0] = 1
+		Design[][1] = tValid[p]
+		
+		for(k=0;k<nbp;k+=1)
+			tau = bpW[k]
+//			Design[][k+2] = (tValid[p] > tau) ? (tValid[p] - tau) : 0
+			firstRow = PWL1D_FirstGreaterBinary(tValid, tau)
+			
+			if(firstRow<nValid)
+				Design[firstRow,nValid-1][k+2] = tValid[p] - tau
+			endif
+		endfor
+		
+		RHS[][0] = yValid[p]
+	endif
+
+    Make/O/D/N=(nCoef)/FREE coef
+
+    if(nPeg==0)
+		// Ordinary weighted/unweighted least squares.
+		MatrixLLS/O/M=1 Design, RHS
+		
+		if(V_flag!=0)
+			//print "MatrixLLS failed. Check breakpoint placement or design-matrix conditioning."
+			return 0
+		endif
+		
+		for(j=0;j<nCoef;j+=1)
+			coef[j] = RHS[j][0]
+		endfor
+    else
+		// Equality-constrained least squares using KKT system:
+		//
+		// [A^T A   C^T] [coef]   [A^T b]
+		// [ C       0 ] [lam ] = [ d   ]
+		//
+		// where C*coef = d are exact endpoint constraints
+		
+		Make/FREE/D/N=(nPeg, nCoef) Constr
+		Make/FREE/D/N=(nPeg) dConstr
+		
+		Variable qq=0	
+		if(doPegFirst)
+			for(j=0;j<nCoef;j+=1)
+				Constr[qq][j] = PWL1D_BasisValue(firstT, j, bpW)
+			endfor
+			dConstr[qq] = pegFirstY
+			qq+=1
+		endif	
+		if(doPegLast)
+			for(j=0;j<nCoef;j+=1)
+				Constr[qq][j] = PWL1D_BasisValue(lastT, j, bpW)
+			endfor
+			dConstr[qq] = pegLastY
+			qq+=1
+		endif
+		
+		Variable sysSize = nCoef+nPeg
+		Make/FREE/D/N=(sysSize, sysSize) KKT=0
+		Make/FREE/D/N=(sysSize, 1) SysRHS=0
+
+		MatrixOp/FREE AtA = Design^t x Design
+		MatrixOp/FREE Atb = Design^t x RHS
+
+		// [ A^T A   C^T ]
+		// [ C       0   ]
+		KKT[0, nCoef-1][0, nCoef-1] = AtA[p][q]
+		KKT[0, nCoef-1][nCoef, sysSize-1] = Constr[q - nCoef][p]
+		KKT[nCoef, sysSize-1][0, nCoef-1] = Constr[p - nCoef][q]
+		
+		// [ A^T b ]
+		// [ d     ]
+		SysRHS[0, nCoef-1][0] = Atb[p][0]
+		SysRHS[nCoef, sysSize-1][0] = dConstr[p - nCoef]
+
+		MatrixLinearSolve/Z/O/M=1 KKT, SysRHS
+
+		if(V_flag!=0)
+			//print "MatrixLinearSolve failed. Endpoint constraints may be inconsistent or the system may be singular."
+			return 0
+		endif
+
+		for(j=0;j<nCoef;j+=1)
+			coef[j] = SysRHS[j][0]
+		endfor
+	endif
+
+//	// Full-length fit
+//	Make/O/D/N=(n) $fitName/Wave=fit = PWL1D_Eval(wT[p], coef, bpW)
+    
+	//Alternative to full-length fit: only write breakpoints. Rest will be taken care of by interpolation later
+	Make/O/D/N=(n) $(outPrefix+"_fit")/Wave=fit = NaN//PWL1D_Eval(wT[p], coef, bpW)//NaN
+	for(qq=0;qq<numpnts(bpW);qq+=1)
+		Variable idx=BinarySearch(wT, bpW[qq])
+		fit[idx] = PWL1D_Eval(wT[idx], coef, bpW)
+	endfor
+	
+	return 1
+End
+
+
+// Basis value for coefficient column j
+Threadsafe Static Function PWL1D_BasisValue(Variable t, Variable j, Wave bpW)
+    if(j==0)
+		return 1
+    endif
+    if(j==1)
+		return t
+    endif
+
+    Variable bp = bpW[j - 2]
+
+    if(t>bp)
+		return t - bp
+    endif
+
+    return 0
+End
+
+
+// Evaluate fitted model
+Threadsafe Static Function PWL1D_Eval(Variable t, Wave coef, Wave bpW)
+	Variable nCoef = numpnts(coef)
+	Variable y = 0
+	
+	Variable j
+	for(j=0;j<nCoef;j+=1)
+		y += coef[j] * PWL1D_BasisValue(t, j, bpW)
+	endfor
+	
+	return y
+End
+
+
+// First finite t index in wave
+Threadsafe Static Function PWL1D_FirstFiniteIndex(Wave wT)
+	Variable n = numpnts(wT)
+	Variable i
+	for(i=0;i<n;i+=1)
+		if(!numtype(wT[i]))
+			return i
+		endif
+	endfor
+	
+	return -1
+End
+
+
+// Last finite t index in wave
+Threadsafe Static Function PWL1D_LastFiniteIndex(Wave wT)
+	Variable i	
+	for(i=numpnts(wT)-1;i>=0;i-=1)
+		if(!numtype(wT[i]))
+			return i
+		endif
+	endfor
+	
+	return -1
+End
+
+
+// Wrapper around binarySearch
+// Returns first index i such that w[i] > x.
+// If no such point exists, returns numpnts(w).
+Threadsafe Static Function PWL1D_FirstGreaterBinary(Wave w, Variable x)
+	Variable firstRow
+	
+	if(numpnts(w)==0)
+		return 0
+	endif
+	
+	Variable bs = BinarySearch(w, x)
+	
+	if (bs==-1)
+		return 0
+	endif
+	
+	if (bs==-2 ||bs==-3)
+		return numpnts(w)
+	endif
+	
+	return bs + 1
+End
+
+
+
+///////////////////////////
+
+Static Constant N_TIMING_DATAPOINTS = 2000
+
+Threadsafe Static Function GetSIC_Cached(Wave traj, Wave W_pauses [Variable noiseSigma, Wave xwave, Wave varianceWave, Variable sum_ln2piVariances])
+	String hash_ = WaveHash(W_pauses,3)+WaveHash(traj,3)
+	hash_ += num2str(noiseSigma)
+	if(!paramisdefault(xwave) && WaveExists(xwave))
+		hash_ += WaveHash(xwave,3)
+	endif
+	if(!paramisdefault(varianceWave) && WaveExists(varianceWave))
+		hash_ += WaveHash(varianceWave,3)
+	endif
+	if(!paramisdefault(sum_ln2piVariances))
+		hash_ += num2str(sum_ln2piVariances)
+	endif
+
+	//wall of code because Igor 8 doesn't support passing through default property of function parameters
+	Variable SIC = Cache_Find("SIC", hash_)
+	if(numtype(SIC)==2) //isNaN
+		if(    paramisdefault(noiseSigma)==1 && paramisdefault(xwave)==1 && paramisdefault(varianceWave)==1 && paramisdefault(sum_ln2piVariances)==1)
+			SIC = GetSIC(traj, W_pauses)
+		elseif(paramisdefault(noiseSigma)==0 && paramisdefault(xwave)==1 && paramisdefault(varianceWave)==1 && paramisdefault(sum_ln2piVariances)==1)
+			SIC = GetSIC(traj, W_pauses, noiseSigma=noiseSigma)
+		elseif(paramisdefault(noiseSigma)==1 && paramisdefault(xwave)==0 && paramisdefault(varianceWave)==1 && paramisdefault(sum_ln2piVariances)==1)
+			SIC = GetSIC(traj, W_pauses, xwave=xwave)
+		elseif(paramisdefault(noiseSigma)==0 && paramisdefault(xwave)==0 && paramisdefault(varianceWave)==1 && paramisdefault(sum_ln2piVariances)==1)
+			SIC = GetSIC(traj, W_pauses, noiseSigma=noiseSigma, xwave=xwave)
+		elseif(paramisdefault(noiseSigma)==1 && paramisdefault(xwave)==1 && paramisdefault(varianceWave)==0 && paramisdefault(sum_ln2piVariances)==1)
+			SIC = GetSIC(traj, W_pauses, varianceWave=varianceWave)
+		elseif(paramisdefault(noiseSigma)==0 && paramisdefault(xwave)==1 && paramisdefault(varianceWave)==0 && paramisdefault(sum_ln2piVariances)==1)
+			SIC = GetSIC(traj, W_pauses, noiseSigma=noiseSigma, varianceWave=varianceWave)
+		elseif(paramisdefault(noiseSigma)==1 && paramisdefault(xwave)==0 && paramisdefault(varianceWave)==0 && paramisdefault(sum_ln2piVariances)==1)
+			SIC = GetSIC(traj, W_pauses, xwave=xwave, varianceWave=varianceWave)
+		elseif(paramisdefault(noiseSigma)==0 && paramisdefault(xwave)==0 && paramisdefault(varianceWave)==0 && paramisdefault(sum_ln2piVariances)==1)
+			SIC = GetSIC(traj, W_pauses, noiseSigma=noiseSigma, xwave=xwave, varianceWave=varianceWave)
+
+		elseif(paramisdefault(noiseSigma)==1 && paramisdefault(xwave)==1 && paramisdefault(varianceWave)==1 && paramisdefault(sum_ln2piVariances)==0)
+			SIC = GetSIC(traj, W_pauses, sum_ln2piVariances=sum_ln2piVariances)
+		elseif(paramisdefault(noiseSigma)==0 && paramisdefault(xwave)==1 && paramisdefault(varianceWave)==1 && paramisdefault(sum_ln2piVariances)==0)
+			SIC = GetSIC(traj, W_pauses, noiseSigma=noiseSigma, sum_ln2piVariances=sum_ln2piVariances)
+		elseif(paramisdefault(noiseSigma)==1 && paramisdefault(xwave)==0 && paramisdefault(varianceWave)==1 && paramisdefault(sum_ln2piVariances)==0)
+			SIC = GetSIC(traj, W_pauses, xwave=xwave, sum_ln2piVariances=sum_ln2piVariances)
+		elseif(paramisdefault(noiseSigma)==0 && paramisdefault(xwave)==0 && paramisdefault(varianceWave)==1 && paramisdefault(sum_ln2piVariances)==0)
+			SIC = GetSIC(traj, W_pauses, noiseSigma=noiseSigma, xwave=xwave, sum_ln2piVariances=sum_ln2piVariances)
+		elseif(paramisdefault(noiseSigma)==1 && paramisdefault(xwave)==1 && paramisdefault(varianceWave)==0 && paramisdefault(sum_ln2piVariances)==0)
+			SIC = GetSIC(traj, W_pauses, varianceWave=varianceWave, sum_ln2piVariances=sum_ln2piVariances)
+		elseif(paramisdefault(noiseSigma)==0 && paramisdefault(xwave)==1 && paramisdefault(varianceWave)==0 && paramisdefault(sum_ln2piVariances)==0)
+			SIC = GetSIC(traj, W_pauses, noiseSigma=noiseSigma, varianceWave=varianceWave, sum_ln2piVariances=sum_ln2piVariances)
+		elseif(paramisdefault(noiseSigma)==1 && paramisdefault(xwave)==0 && paramisdefault(varianceWave)==0 && paramisdefault(sum_ln2piVariances)==0)
+			SIC = GetSIC(traj, W_pauses, xwave=xwave, varianceWave=varianceWave, sum_ln2piVariances=sum_ln2piVariances)
+		elseif(paramisdefault(noiseSigma)==0 && paramisdefault(xwave)==0 && paramisdefault(varianceWave)==0 && paramisdefault(sum_ln2piVariances)==0)
+			SIC = GetSIC(traj, W_pauses, noiseSigma=noiseSigma, xwave=xwave, varianceWave=varianceWave, sum_ln2piVariances=sum_ln2piVariances)
+		endif
+	
+		Cache_Add("SIC", hash_, SIC)
+	endif
+	
+	return SIC
+End
+
+//Generate a cache for data storage
+Threadsafe Static Function Cache_Make(String cachename, Variable maxsize)
+	DFREF fld = root:Packages:FindPauses
+	if(DataFolderRefStatus(fld)==0)
+		NewDataFolder/O root:Packages
+		NewDataFolder/O root:Packages:FindPauses
+		DFREF fld = root:Packages:FindPauses
+	endif
+
+	Variable/G fld:$("CACHE_"+cachename+"_maxsize") = maxsize
+	Make/O/N=0 fld:$("CACHE_"+cachename+"_Value")
+	Make/O/T/N=0 fld:$("CACHE_"+cachename+"_Hash") = ""
+	Variable/G fld:$("CACHE_"+cachename+"_nreadfound") = 0    //counts how often we tried to read from cache and found the result
+	Variable/G fld:$("CACHE_"+cachename+"_nreadnotfound") = 0 //counts how often we tried to read from cache and didn't find the result
+	Variable/G fld:$("CACHE_"+cachename+"_lookbackmax") = 0 //records the biggest index in the cache where we found the result
+
+	Make/O/N=(N_TIMING_DATAPOINTS) fld:$("CACHE_"+cachename+"_lookuptimes")=NaN, fld:$("CACHE_"+cachename+"_calctimes")=NaN
+	Variable/G fld:$("CACHE_"+cachename+"_tlastFailedLookup")=NaN
+End
+
+Threadsafe Static Function Cache_Clear(String cachename)
+	DFREF fld = root:Packages:FindPauses
+
+	Wave/SDFR=fld CACHE_Value = $("CACHE_"+cachename+"_Value")
+	Wave/SDFR=fld/T CACHE_Hash = $("CACHE_"+cachename+"_Hash")
+	NVAR/SDFR=fld Nreadfound = $("CACHE_"+cachename+"_nreadfound")
+	NVAR/SDFR=fld Nreadnotfound = $("CACHE_"+cachename+"_nreadnotfound")
+	NVAR/SDFR=fld lookbackmax = $("CACHE_"+cachename+"_lookbackmax")
+
+	Wave/SDFR=fld lookuptimes = $("CACHE_"+cachename+"_lookuptimes"), calctimes = $("CACHE_"+cachename+"_calctimes")
+	NVAR/SDFR=fld tlastfailedlookup = $("CACHE_"+cachename+"_tlastFailedLookup")
+	
+	Redimension/N=0 CACHE_Value
+	Redimension/N=0 CACHE_Hash
+	NreadFound = 0
+	NreadnotFound = 0
+	lookbackmax = 0
+	lookuptimes = NaN
+	calcTimes = NaN
+	tlastfailedlookup = NaN
+End
+
+Threadsafe Static Function Cache_Find(String cachename, String hash_)
+	DFREF fld = root:Packages:FindPauses
+	Wave/SDFR=fld CACHE_Value = $("CACHE_"+cachename+"_Value")
+	Wave/SDFR=fld/T CACHE_Hash = $("CACHE_"+cachename+"_Hash")
+	NVAR/SDFR=fld Nreadfound = $("CACHE_"+cachename+"_nreadfound")
+	NVAR/SDFR=fld Nreadnotfound = $("CACHE_"+cachename+"_nreadnotfound")
+	NVAR/SDFR=fld lookbackmax = $("CACHE_"+cachename+"_lookbackmax")
+
+	Wave/SDFR=fld lookuptimes = $("CACHE_"+cachename+"_lookuptimes")
+	NVAR/SDFR=fld tlastfailedlookup = $("CACHE_"+cachename+"_tlastFailedLookup")
+
+	//performance timing of lookup
+	Variable t0 = StopMSTimer(-2)
+	FindValue/Z/TEXT=(hash_)/TXOP=(4)/UOFV CACHE_Hash
+
+	Variable tLookup = StopMSTimer(-2) - t0
+
+	DeletePoints numpnts(lookuptimes)-1, 1, lookuptimes
+	InsertPoints/V=(tLookup) 0, 1, lookuptimes
+
+	if(v_value>=0 && v_startpos==0)
+		Nreadfound += 1
+		lookbackmax = max(lookbackmax, v_value)
+		return CACHE_Value[v_value]
+	else
+		tLastFailedLookup = StopMSTimer(-2)
+		Nreadnotfound += 1
+		return NaN
+	endif
+End
+
+Threadsafe Static Function Cache_Add(String cachename, String hash_, Variable value)
+	DFREF fld = root:Packages:FindPauses
+	NVAR/SDFR=fld CACHE_maxsize = $("CACHE_"+cachename+"_maxsize")
+	Wave/SDFR=fld CACHE_Value = $("CACHE_"+cachename+"_Value")
+	Wave/SDFR=fld/T CACHE_Hash = $("CACHE_"+cachename+"_Hash")
+
+	NVAR/SDFR=fld tlastfailedlookup = $("CACHE_"+cachename+"_tlastFailedLookup")
+	Wave/SDFR=fld calctimes = $("CACHE_"+cachename+"_calctimes")
+
+	if(CACHE_maxSize==0)
+		return 0
+	endif
+
+	//performance timing
+	if(!numtype(tlastfailedlookup))
+		Variable tCalc = StopMSTimer(-2) - tlastfailedlookup
+		DeletePoints numpnts(calctimes)-1, 1, calctimes
+		InsertPoints/V=(tCalc) 0, 1, calctimes
+	endif
+
+	if(numpnts(CACHE_Value) == CACHE_maxsize)
+		DeletePoints numpnts(CACHE_Value)-1, 1, CACHE_Value, CACHE_Hash
+	endif
+
+	InsertPoints 0, 1, CACHE_Value, CACHE_Hash
+	CACHE_Value[0] = value
+	CACHE_Hash[0] = hash_
+End
+
